@@ -1,0 +1,292 @@
+####PANGENOME#########
+
+micromamba activate prokka146
+nano prokka_run.sh
+#!/bin/bash
+
+set -euo pipefail
+
+##################################################
+# ACTIVATE PROKKA ENVIRONMENT
+##################################################
+
+eval "$(micromamba shell hook --shell bash)"
+micromamba activate prokka146
+
+##################################################
+# PARAMETERS
+##################################################
+
+GENOME_DIR="/home/tofick/Bacillus_Project/checkm_input"
+OUTDIR="/home/tofick/Bacillus_Project/prokka_out"
+
+GENUS="Bacillus"
+KINGDOM="Bacteria"
+
+# Your laptop has 8 cores
+CPUS=8
+
+##################################################
+# CREATE OUTPUT DIRECTORY
+##################################################
+
+mkdir -p "$OUTDIR"
+
+##################################################
+# CHECK IF PROKKA EXISTS
+##################################################
+
+echo "======================================"
+echo "Checking Prokka installation"
+echo "======================================"
+
+prokka --version
+blastp -version
+
+echo "======================================"
+echo "Starting Prokka annotation"
+echo "Genomes: $GENOME_DIR"
+echo "Output : $OUTDIR"
+echo "======================================"
+
+##################################################
+# RUN PROKKA
+##################################################
+
+shopt -s nullglob
+
+for genome in "$GENOME_DIR"/*.fna; do
+
+    base=$(basename "$genome" .fna)
+
+    echo ""
+    echo "--------------------------------------"
+    echo "Annotating: $base"
+    echo "--------------------------------------"
+
+    prokka "$genome" \
+        --outdir "$OUTDIR/$base" \
+        --prefix "$base" \
+        --genus "$GENUS" \
+        --kingdom "$KINGDOM" \
+        --cpus "$CPUS" \
+        --force
+
+done
+
+##################################################
+# FINISH
+##################################################
+
+echo ""
+echo "======================================"
+echo "ALL PROKKA ANNOTATIONS COMPLETED"
+echo "Results saved in:"
+echo "$OUTDIR"
+echo "======================================"
+
+chmod +x prokka_run.sh
+./prokka_run.sh
+micromamba create -n prokka146 \
+-c conda-forge \
+-c bioconda \
+python=3.9 \
+prokka=1.14.6 \
+blast=2.14.1 \
+parallel=20220522 \
+-y
+
+# ========================================================================
+# ROARY PANGENOME ANALYSIS PIPELINE (FULL FIXED VERSION)
+# ========================================================================
+
+# -------------------------
+# 1. Libraries
+# -------------------------
+library(tidyverse)
+library(data.table)
+library(micropan)
+library(ggrepel)
+library(viridis)
+library(scales)
+
+# -------------------------
+# 2. Load Roary file
+# -------------------------
+
+roary_file <- "/home/tofick/Bacillus_Project/roary_input/roary_results/gene_presence_absence.csv"
+
+roary <- fread(roary_file)
+
+# -------------------------
+# 3. Extract gene matrix (CRITICAL FIX)
+# -------------------------
+
+meta_cols <- c(
+  "Gene",
+  "Non-unique Gene name",
+  "Annotation",
+  "No. isolates",
+  "No. sequences"
+)
+
+gene_mat <- roary[, !meta_cols, with = FALSE]
+
+# FORCE numeric conversion (VERY IMPORTANT)
+gene_mat <- as.data.frame(lapply(gene_mat, function(x) as.numeric(as.character(x))))
+
+rownames(gene_mat) <- roary$Gene
+
+# Replace NA with 0
+gene_mat[is.na(gene_mat)] <- 0
+
+# Convert to matrix
+gene_mat <- as.matrix(gene_mat)
+
+# Force numeric storage mode
+storage.mode(gene_mat) <- "numeric"
+
+# Binarize
+gene_mat[gene_mat > 0] <- 1
+
+cat("Matrix type:", typeof(gene_mat), "\n")
+cat("Matrix size:", dim(gene_mat), "\n")
+
+# -------------------------
+# 4. Core / Shell / Cloud genes
+# -------------------------
+
+gene_counts <- colSums(gene_mat)
+
+core_genes  <- sum(gene_counts == nrow(gene_mat))
+shell_genes <- sum(gene_counts > 1 & gene_counts < nrow(gene_mat))
+cloud_genes <- sum(gene_counts == 1)
+
+pan_total <- ncol(gene_mat)
+
+# -------------------------
+# 5. Genomic fluidity
+# -------------------------
+
+fluid <- tryCatch({
+  micropan::fluidity(gene_mat, n.sim = 500)
+}, error = function(e) c(NA, NA))
+
+# -------------------------
+# 6. Pangenome accumulation curve
+# -------------------------
+
+n <- nrow(gene_mat)
+
+accum_curve <- sapply(1:n, function(k) {
+  mean(replicate(100, {
+    samp <- sample(n, k)
+    sum(colSums(gene_mat[samp, , drop = FALSE]) > 0)
+  }))
+})
+
+# -------------------------
+# 7. Alpha (Heaps-like model)
+# -------------------------
+
+alpha_fit <- tryCatch({
+  model <- lm(log(accum_curve) ~ log(1:n))
+  abs(coef(model)[2])
+}, error = function(e) NA)
+
+# -------------------------
+# 8. Unique genes per genome (FIXED)
+# -------------------------
+
+unique_gene_flags <- colSums(gene_mat) == 1
+
+unique_genes_per_genome <- gene_mat %*% unique_gene_flags
+
+unique_df <- data.frame(
+  genome = rownames(gene_mat),
+  unique_genes = as.numeric(unique_genes_per_genome),
+  total_genes = rowSums(gene_mat),
+  perc_unique = (as.numeric(unique_genes_per_genome) / rowSums(gene_mat)) * 100
+)
+
+write.csv(
+  unique_df,
+  "/home/tofick/Bacillus_Project/roary_input/unique_genes_per_genome.csv",
+  row.names = FALSE
+)
+
+# -------------------------
+# 9. Summary results table
+# -------------------------
+
+results <- data.frame(
+  dataset = "Roary_Bacillus",
+  genomes = nrow(gene_mat),
+  pan_genome = pan_total,
+  core = core_genes,
+  shell = shell_genes,
+  cloud = cloud_genes,
+  alpha = alpha_fit,
+  fluidity_mean = fluid[1],
+  fluidity_sd = fluid[2]
+)
+
+write.csv(
+  results,
+  "/home/tofick/Bacillus_Project/roary_input/roary_pangenome_summary.csv",
+  row.names = FALSE
+)
+
+# -------------------------
+# 10. Accumulation curve plot
+# -------------------------
+
+curve_df <- data.frame(
+  genomes = 1:n,
+  genes = accum_curve
+)
+
+p1 <- ggplot(curve_df, aes(genomes, genes)) +
+  geom_line(color = "darkred", linewidth = 1) +
+  theme_bw() +
+  labs(
+    title = "Roary Pangenome Accumulation Curve",
+    x = "Number of Genomes",
+    y = "Gene Families"
+  )
+
+ggsave(
+  "roary_accumulation_curve.png",
+  p1,
+  width = 10,
+  height = 6,
+  dpi = 600
+)
+
+# -------------------------
+# 11. Fluidity vs Alpha plot
+# -------------------------
+
+p2 <- ggplot(results, aes(x = alpha, y = fluidity_mean)) +
+  geom_point(size = 5, color = "steelblue") +
+  geom_smooth(method = "lm", se = TRUE) +
+  theme_bw() +
+  labs(
+    title = "Genomic Fluidity vs Pangenome Saturation",
+    x = "Alpha",
+    y = "Genomic Fluidity"
+  )
+
+ggsave(
+  "fluidity_vs_alpha.png",
+  p2,
+  width = 10,
+  height = 7,
+  dpi = 600
+)
+
+# -------------------------
+# 12. Final output
+# -------------------------
+
+print(results)
