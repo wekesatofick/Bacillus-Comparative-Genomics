@@ -1,0 +1,151 @@
+##########MASH#######################################
+# Activate environment
+conda activate mash_env
+nano run_mash_pipeline.sh
+#!/bin/bash
+
+# =========================
+# MASH PIPELINE (166 genomes)
+# =========================
+
+set -e  # stop if any command fails
+
+# Genome directory
+GENOME_DIR="/home/tofick/Bacillus_Project/checkm_input"
+
+# Output directory
+OUTDIR="/home/tofick/Bacillus_Project/mash_results"
+
+mkdir -p "$OUTDIR"
+
+cd "$GENOME_DIR"
+
+echo "📁 Working in: $GENOME_DIR"
+echo "📦 Output in: $OUTDIR"
+
+# =========================
+# Function to run mash
+# =========================
+run_mash () {
+    SIZE=$1
+
+    echo "=============================="
+    echo "Running MASH with -s $SIZE"
+    echo "=============================="
+
+    SKETCH="$OUTDIR/sketch_s${SIZE}"
+
+    mash sketch -o "$SKETCH" -p 50 -s "$SIZE" *.fna
+
+    mash dist -p 50 \
+        "${SKETCH}.msh" \
+        "${SKETCH}.msh" \
+        > "$OUTDIR/hector_s${SIZE}.tsv"
+
+    echo "✔ Done: hector_s${SIZE}.tsv"
+}
+
+# =========================
+# Run all analyses
+# =========================
+
+run_mash 1000
+run_mash 3000
+run_mash 5000
+
+echo "🎉 ALL DONE!"
+chmod +x run_mash_pipeline.sh
+./run_mash_pipeline.sh
+### Rstudio####
+############ MASH ROBUSTNESS ANALYSIS (s3000 vs s5000) ############
+
+library(dplyr)
+library(readr)
+library(stringr)
+library(ggplot2)
+
+# ----------------------------------------------------
+# 1. Load datasets
+# ----------------------------------------------------
+
+s3000 <- read_tsv(
+  "/home/tofick/Bacillus_Project/mash_results/hector_s3000.tsv",
+  col_names = FALSE
+)
+
+s5000 <- read_tsv(
+  "/home/tofick/Bacillus_Project/mash_results/hector_s5000.tsv",
+  col_names = FALSE
+)
+
+# ----------------------------------------------------
+# 2. Name columns
+# ----------------------------------------------------
+
+colnames(s3000) <- c("genome1", "genome2", "dist3000", "pvalue", "shared_hashes")
+colnames(s5000) <- c("genome1", "genome2", "dist5000", "pvalue", "shared_hashes")
+
+# ----------------------------------------------------
+# 3. Remove self comparisons
+# ----------------------------------------------------
+
+s3000 <- s3000 %>% filter(genome1 != genome2)
+s5000 <- s5000 %>% filter(genome1 != genome2)
+
+# ----------------------------------------------------
+# 4. Join datasets (ONLY for comparison, not merging results)
+# ----------------------------------------------------
+
+merged <- inner_join(
+  s3000 %>% select(genome1, genome2, dist3000),
+  s5000 %>% select(genome1, genome2, dist5000),
+  by = c("genome1", "genome2")
+)
+
+# ----------------------------------------------------
+# 5. Correlation analysis (robustness check)
+# ----------------------------------------------------
+
+correlation <- cor(merged$dist3000, merged$dist5000)
+print(paste("Correlation between s3000 and s5000:", correlation))
+
+# ----------------------------------------------------
+# 6. Plot correlation (IMPORTANT for paper)
+# ----------------------------------------------------
+
+ggplot(merged, aes(x = dist3000, y = dist5000)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm") +
+  labs(
+    title = "MASH Stability Check (s3000 vs s5000)",
+    x = "MASH distance (s3000)",
+    y = "MASH distance (s5000)"
+  )
+
+# ----------------------------------------------------
+# 7. Convert s3000 to identity (MAIN ANALYSIS)
+# ----------------------------------------------------
+
+s3000_main <- s3000 %>%
+  mutate(identity = 1 - dist3000)
+
+# ----------------------------------------------------
+# 8. Filter high similarity clusters (species-level)
+# ----------------------------------------------------
+
+high_similarity <- s3000_main %>%
+  filter(identity > 0.95)
+
+# ----------------------------------------------------
+# 9. Save outputs
+# ----------------------------------------------------
+
+write_csv(
+  merged,
+  "/home/tofick/Bacillus_Project/mash_results/mash_s3000_vs_s5000_comparison.csv"
+)
+
+write_csv(
+  high_similarity,
+  "/home/tofick/Bacillus_Project/mash_results/mash_high_similarity_s3000.csv"
+)
