@@ -1,1 +1,19 @@
+##################DOWNLOADING GENOMES FROM NCBI#######
 
+####################Bacillus species######################
+
+##########Get assembly list (RefSeq + complete genomes)######
+esearch -db assembly -query "genus species[ORGN] AND latest[filter] AND \"complete genome\"[filter]" \
+| efetch -format docsum \
+| xtract -pattern DocumentSummary -element AssemblyAccession,SpeciesName,AssemblyName \
+| head -n 30
+ 
+esearch -db assembly -query "Bacillus subtilis[ORGN] AND latest[filter] AND \"complete genome\"[filter]" \
+| esummary \
+| xtract -pattern DocumentSummary -element AssemblyAccession \
+| head -n 30 > bacillus_subtilis_30.txt
+
+conda install -c conda-forge ncbi-datasets-cli
+
+datasets download genome accession --inputfile bacillus_subtilis_30.txt --include genome
+unzip ncbi_dataset.zip
