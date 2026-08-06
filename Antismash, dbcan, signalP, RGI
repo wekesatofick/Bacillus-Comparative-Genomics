@@ -1,0 +1,550 @@
+#####ANTISMASH####
+conda activate antismash_env
+ls /home/tofick/Bacillus_Project/prokka_gbk_files/*.gbk
+mkdir -p /home/tofick/Bacillus_Project/antismash_results
+mkdir -p /home/tofick/Bacillus_Project/antismash_results/logs
+nano run_antismash.sh
+#!/bin/bash
+
+INPUT_DIR="/home/tofick/Bacillus_Project/prokka_gbk_files"
+OUTPUT_DIR="/home/tofick/Bacillus_Project/antismash_results"
+LOG_DIR="${OUTPUT_DIR}/logs"
+
+THREADS=6
+CPUS_PER_GENOME=2
+
+mkdir -p "${OUTPUT_DIR}" "${LOG_DIR}"
+
+process_genome() {
+    gbk_file="$1"
+    base_id=$(basename "$gbk_file" .gbk)
+    log_file="${LOG_DIR}/${base_id}.log"
+    outdir="${OUTPUT_DIR}/${base_id}"
+
+    echo "START $base_id" | tee "$log_file"
+
+    antismash \
+        --output-dir "$outdir" \
+        --genefinding-tool prodigal \
+        --taxon bacteria \
+        --cpus $CPUS_PER_GENOME \
+        "$gbk_file" &>> "$log_file"
+
+    if [ $? -eq 0 ]; then
+        echo "SUCCESS" | tee -a "$log_file"
+    else
+        echo "FAILED" | tee -a "$log_file"
+    fi
+}
+
+export -f process_genome
+export OUTPUT_DIR LOG_DIR CPUS_PER_GENOME
+
+find "$INPUT_DIR" -maxdepth 1 -name "*.gbk" | \
+xargs -P $THREADS -I {} bash -c 'process_genome "$1"' _ {}
+chmod +x run_antismash.sh
+./run_antismash.sh
+tail -f /home/tofick/Bacillus_Project/antismash_results/logs/*.log
+##post_antismash_pipeline.sh###
+#!/bin/bash
+
+###############################################################################
+# POST-antiSMASH ANALYSIS PIPELINE (FIXED VERSION)
+###############################################################################
+
+ANTISMASH_DIR="/home/tofick/Bacillus_Project/antismash_results"
+OUT="/home/tofick/Bacillus_Project/post_antismash"
+
+SUMMARY="${OUT}/BGC_summary.tsv"
+MATRIX="${OUT}/BGC_matrix.tsv"
+
+mkdir -p "${OUT}"
+
+echo -e "Genome\tRegion\tProduct" > "${SUMMARY}"
+
+###############################################################################
+# STEP 1 — EXTRACT BGC DATA (FIXED GENE NAME HANDLING)
+###############################################################################
+
+echo "Extracting BGC data..."
+
+find "${ANTISMASH_DIR}" -name "*region*.gbk" | while read file
+do
+    # FIX: use full sample folder name (NOT internal accession)
+    genome=$(basename "$(dirname "$file")")
+
+    region=$(basename "$file" | grep -o "region[0-9]*")
+
+    product=$(grep "/product=" "$file" | head -1 | \
+        sed 's/.*product="//' | sed 's/"//')
+
+    echo -e "${genome}\t${region}\t${product}" >> "${SUMMARY}"
+
+done
+
+echo "BGC summary created: ${SUMMARY}"
+
+###############################################################################
+# STEP 2 — COUNT BGC TYPES
+###############################################################################
+
+echo "Counting BGC types..."
+
+cut -f3 "${SUMMARY}" | sort | uniq -c | sort -nr \
+> "${OUT}/BGC_type_counts.txt"
+
+###############################################################################
+# STEP 3 — CREATE PRESENCE/ABSENCE MATRIX (FIXED ORDER ISSUE)
+###############################################################################
+
+echo "Building matrix..."
+
+awk -F'\t' '
+NR>1{
+    genomes[$1]=1
+    bgcs[$3]=1
+    matrix[$1,$3]=1
+}
+
+END{
+    printf "Genome"
+
+    for (b in bgcs)
+        printf "\t%s", b
+
+    printf "\n"
+
+    for (g in genomes){
+        printf "%s", g
+
+        for (b in bgcs){
+            if(matrix[g,b]==1)
+                printf "\t1"
+            else
+                printf "\t0"
+        }
+        printf "\n"
+    }
+}
+' "${SUMMARY}" > "${MATRIX}"
+
+###############################################################################
+# STEP 4 — CORE & UNIQUE BGCs
+###############################################################################
+
+TOTAL_GENOMES=$(cut -f1 "${SUMMARY}" | tail -n +2 | sort | uniq | wc -l)
+
+# Core BGCs (present in ALL genomes)
+awk -F'\t' -v total="${TOTAL_GENOMES}" '
+NR>1{
+    count[$3]++
+}
+
+END{
+    for (b in count){
+        if(count[b]==total)
+            print b
+    }
+}
+' "${SUMMARY}" > "${OUT}/core_BGCs.txt"
+
+# Unique BGCs
+cut -f3 "${SUMMARY}" | sort | uniq -u > "${OUT}/unique_BGCs.txt"
+
+###############################################################################
+# STEP 5 — SUMMARY
+###############################################################################
+
+echo "DONE"
+echo "Output folder: ${OUT}"
+
+echo ""
+echo "Files generated:"
+echo " - BGC_summary.tsv"
+echo " - BGC_matrix.tsv"
+echo " - BGC_type_counts.txt"
+echo " - core_BGCs.txt"
+echo " - unique_BGCs.txt"
+
+#################dbcan###################
+
+# Install
+conda create -n dbcan_env -c conda-forge -c bioconda dbcan
+conda activate dbcan_env
+nano run_dbcan_all.sh
+#!/bin/bash
+
+INPUT_DIR=/home/tofick/Bacillus_Project/prokka_faa
+OUTPUT_DIR=/home/tofick/Bacillus_Project/dbcan_results
+DB_DIR=/home/tofick/dbcan_db
+
+mkdir -p $OUTPUT_DIR
+
+for faa in $INPUT_DIR/*.faa
+do
+    genome=$(basename "$faa" .faa)
+
+    echo "===================================="
+    echo "Processing: $genome"
+    echo "===================================="
+
+    run_dbcan CAZyme_annotation \
+        --mode protein \
+        --input_raw_data "$faa" \
+        --output_dir "$OUTPUT_DIR/$genome" \
+        --db_dir "$DB_DIR" \
+        --methods diamond,hmm,dbCANsub \
+        --threads 4
+
+done
+
+echo "All genomes completed."
+chmod +x run_dbcan_all.sh
+./run_dbcan_all.sh
+
+##Build a CAZyme presence/absence matrix##
+cd ~/Bacillus_Project/dbcan_results
+
+nano build_cazy_matrix.py
+#!/usr/bin/env python3
+
+import pandas as pd
+import glob
+import os
+import re
+
+dbcan_dir = "/home/tofick/Bacillus_Project/dbcan_results"
+
+all_families = set()
+genome_profiles = {}
+
+overview_files = glob.glob(
+    os.path.join(dbcan_dir, "*", "overview.tsv")
+)
+
+print(f"Found {len(overview_files)} overview files")
+
+for file in overview_files:
+
+    genome = os.path.basename(os.path.dirname(file))
+
+    try:
+        df = pd.read_csv(file, sep="\t")
+
+    except Exception as e:
+        print(f"Skipping {genome}: {e}")
+        continue
+
+    families = set()
+
+    if "Recommend Results" not in df.columns:
+        print(f"No Recommend Results column in {genome}")
+        continue
+
+    for val in df["Recommend Results"].dropna():
+
+        val = str(val)
+
+        if val == "-" or val.strip() == "":
+            continue
+
+        hits = val.split("|")
+
+        for hit in hits:
+
+            fam = re.sub(r"_e\d+$", "", hit)
+
+            fam = re.sub(r"_e\d+.*", "", fam)
+
+            fam = fam.strip()
+
+            if fam != "":
+                families.add(fam)
+
+    genome_profiles[genome] = families
+    all_families.update(families)
+
+print(f"Detected {len(all_families)} CAZyme families")
+
+all_families = sorted(all_families)
+
+matrix = pd.DataFrame(
+    0,
+    index=sorted(genome_profiles.keys()),
+    columns=all_families
+)
+
+for genome, fams in genome_profiles.items():
+    for fam in fams:
+        matrix.loc[genome, fam] = 1
+
+matrix.to_csv("CAZyme_presence_absence.csv")
+
+print(matrix.shape)
+print("Saved CAZyme_presence_absence.csv")
+Ctrl+O
+Enter
+Ctrl+X
+python build_cazy_matrix.py
+
+##Calculate Core and Accessory CAZymes##
+nano core_accessory_cazy.py
+import pandas as pd
+
+df = pd.read_csv(
+    "CAZyme_presence_absence.csv",
+    index_col=0
+)
+
+n_genomes = len(df)
+
+core = []
+accessory = []
+
+for fam in df.columns:
+
+    count = df[fam].sum()
+
+    if count == n_genomes:
+        core.append(fam)
+    else:
+        accessory.append(fam)
+
+print("Genomes:", n_genomes)
+print("Core CAZymes:", len(core))
+print("Accessory CAZymes:", len(accessory))
+
+pd.Series(core).to_csv(
+    "Core_CAZymes.csv",
+    index=False,
+    header=False
+)
+
+pd.Series(accessory).to_csv(
+    "Accessory_CAZymes.csv",
+    index=False,
+    header=False
+)
+python core_accessory_cazy.py
+##CAZyme Class Abundance##
+nano cazy_class_abundance.py
+import pandas as pd
+
+df = pd.read_csv(
+    "CAZyme_presence_absence.csv",
+    index_col=0
+)
+
+classes = ["GH","GT","CE","PL","AA","CBM"]
+
+out = pd.DataFrame(index=df.index)
+
+for c in classes:
+
+    cols = [x for x in df.columns if x.startswith(c)]
+
+    out[c] = df[cols].sum(axis=1)
+
+out.to_csv("CAZyme_class_counts.csv")
+
+print(out.head())
+python cazy_class_abundance.py
+##Species Clustering##
+nano cazy_clustered_heatmap.R
+library(pheatmap)
+
+mat <- read.csv(
+"CAZyme_presence_absence.csv",
+row.names = 1,
+check.names = FALSE
+)
+
+pheatmap(
+mat,
+clustering_distance_rows = "binary",
+clustering_distance_cols = "binary",
+clustering_method = "ward.D2",
+fontsize_row = 5,
+fontsize_col = 6,
+filename = "CAZyme_clustered_heatmap.pdf",
+width = 16,
+height = 14
+)
+Rscript cazy_clustered_heatmap.R
+
+#####################################################
+############################################################
+#################signalp######################
+# Install
+conda create -n signalp6 python=3.10
+conda activate signalp6
+cd /home/tofick/Bacillus_Project/prokka_faa
+
+eexport SIGNALP_MODEL_DIR=/home/tofick/signalp6_fast/signalp-6-package/signalp/model_weights
+
+cd /home/tofick/Bacillus_Project/prokka_faa
+
+mkdir -p signalp_results signalp_logs
+
+for f in *.faa
+do
+    name=$(basename "$f" .faa)
+
+    echo "Running: $name"
+
+    signalp6 \
+        --fastafile "$f" \
+        --mode fast \
+        --organism other \
+        --output_dir "signalp_results/$name" \
+        > "signalp_logs/${name}.log" 2>&1
+
+done
+##Secretome Matrix##
+mkdir -p 01_clean_faa
+
+for f in *.faa
+do
+    genome=$(basename "$f" .faa)
+
+    awk -v g="$genome" '
+    /^>/{
+        split($0,a," ");
+        sub(/^>/,"",a[1]);
+        print ">" g "|" a[1];
+        next
+    }
+    {print}
+    ' "$f" > 01_clean_faa/${genome}.faa
+done
+cat 01_clean_faa/*.faa > all_secretomes.faa
+cd-hit \
+  -i all_secretomes.faa \
+  -o secretome_clusters \
+  -c 0.9 \
+  -aS 0.8 \
+  -T 8 \
+  -M 0
+#Convert CD-HIT clusters → genome matrix mapping#
+import pandas as pd
+from collections import defaultdict
+
+clstr_file = "secretome_clusters.clstr"
+
+# cluster → genomes
+cluster_genomes = defaultdict(set)
+
+cluster_id = -1
+
+with open(clstr_file) as f:
+    for line in f:
+        line = line.strip()
+
+        if line.startswith(">Cluster"):
+            cluster_id += 1
+            continue
+
+        # protein line
+        parts = line.split()
+
+        # format: >Genome|protein...
+        for p in parts:
+            if p.startswith(">"):
+                header = p[1:]
+                genome = header.split("|")[0]
+                cluster_genomes[cluster_id].add(genome)
+
+# all genomes
+all_genomes = sorted({g for gs in cluster_genomes.values() for g in gs})
+
+# build matrix
+matrix = pd.DataFrame(0, index=sorted(cluster_genomes.keys()), columns=all_genomes)
+
+for cluster, genomes in cluster_genomes.items():
+    for g in genomes:
+        matrix.loc[cluster, g] = 1
+
+matrix.index.name = "Cluster"
+
+matrix.to_csv("secretome_matrix.csv")
+
+print("Matrix saved: secretome_matrix.csv")
+print("Clusters:", len(matrix))
+print("Genomes:", len(matrix.columns))
+python3 build_secretome_matrix.py
+
+#Fix column orientation (optional but recommended)#
+matrix = matrix.T
+matrix.to_csv("secretome_matrix_genome_by_cluster.csv")
+ 
+#Check correctness#
+cut -d',' -f1 secretome_matrix.csv | head
+#QC checks#
+grep -o "Bacillus\|Priestia\|S22" secretome_matrix.csv | sort | uniq | wc -l
+
+################################################################################
+###############################################################################
+##################RGI#####################################
+conda activate rgi6
+nano rgi_matrix_builder.py
+import os
+import pandas as pd
+
+input_dir = "/home/tofick/Bacillus_Project/prokka_faa/RGI_results"
+
+files = [f for f in os.listdir(input_dir) if f.endswith(".txt")]
+
+all_data = []
+
+for f in files:
+    genome = f.replace(".txt", "")
+    path = os.path.join(input_dir, f)
+
+    df = pd.read_csv(path, sep="\t")
+
+    # Keep only important columns
+    cols = ["Best_Hit_ARO", "Drug Class", "Resistance Mechanism"]
+    df = df[cols].dropna()
+
+    df["Genome"] = genome
+
+    all_data.append(df)
+
+data = pd.concat(all_data)
+
+# -------------------------
+# 1. Genome × ARO matrix
+# -------------------------
+aro_matrix = pd.crosstab(data["Genome"], data["Best_Hit_ARO"])
+aro_matrix = (aro_matrix > 0).astype(int)
+aro_matrix.to_csv("Genome_ARO_matrix.csv")
+
+# -------------------------
+# 2. Genome × Drug Class
+# -------------------------
+drug_matrix = pd.crosstab(data["Genome"], data["Drug Class"])
+drug_matrix.to_csv("Genome_DrugClass_matrix.csv")
+
+# -------------------------
+# 3. Genome × Resistance Mechanism
+# -------------------------
+mech_matrix = pd.crosstab(data["Genome"], data["Resistance Mechanism"])
+mech_matrix.to_csv("Genome_Mechanism_matrix.csv")
+
+# -------------------------
+# 4. Core vs accessory resistome
+# -------------------------
+aro_freq = aro_matrix.sum(axis=0) / aro_matrix.shape[0]
+
+core = aro_freq[aro_freq >= 0.95].index
+accessory = aro_freq[aro_freq < 0.95].index
+
+core_df = pd.DataFrame(core, columns=["Core_AROs"])
+accessory_df = pd.DataFrame(accessory, columns=["Accessory_AROs"])
+
+core_df.to_csv("Core_AROs.csv", index=False)
+accessory_df.to_csv("Accessory_AROs.csv", index=False)
+
+print("DONE: All matrices generated")
+conda activate rgi6
+python rgi_matrix_builder.py
