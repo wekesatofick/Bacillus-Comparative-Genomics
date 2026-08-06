@@ -1,0 +1,206 @@
+ ###################CHECK M############################################
+mamba install -c bioconda -c conda-forge checkm-genome=1.1.3 -y
+checkm --version
+checkm taxonomy_wf genus Bacillus \ 
+-t 8 \ 
+-x fna \ 
+/home/tofick/Bacillus_Project/checkm_input \ 
+/home/tofick/Bacillus_Project/checkm_output 
+
+checkm qa \
+/home/tofick/Bacillus_Project/checkm_output/Bacillus.ms \
+/home/tofick/Bacillus_Project/checkm_output \
+-o 2 \
+> /home/tofick/Bacillus_Project/checkm_quality_assessment.txt
+
+# Data in R
+# Load libraries
+library(dplyr)
+library(readr)
+
+# Read CheckM TSV file properly
+bacillus_data <- read_tsv(
+  "C:/Users/Tofick/Desktop/s22/checkm_quality_assessment.tsv"
+)
+
+# ===============================
+# YOUR ORIGINAL RENAME BLOCK (UPDATED FOR REAL TSV COLUMN NAMES)
+# ===============================
+bacillus_data <- bacillus_data %>% 
+  rename(
+    `Bin Id` = `Bin Id`,
+    `Marker lineage` = `Marker lineage`,
+    Genomes = `# genomes`,
+    Markers = `# markers`,
+    `Marker sets` = `# marker sets`,
+    Completeness = Completeness,
+    Contamination = Contamination,
+    `Strain heterogeneity` = `Strain heterogeneity`,
+    `0` = `0`,
+    `1` = `1`,
+    `2` = `2`,
+    `3` = `3`,
+    `4` = `4`,
+    `5+` = `5+`
+  )
+
+# Convert key columns to numeric
+bacillus_data <- bacillus_data %>%
+  mutate(
+    Completeness = as.numeric(Completeness),
+    Contamination = as.numeric(Contamination),
+    `Strain heterogeneity` = as.numeric(`Strain heterogeneity`)
+  )
+
+# Save full dataset
+write.csv(
+  bacillus_data,
+  "C:/Users/Tofick/Desktop/s22/bacillus_data.csv",
+  row.names = FALSE
+)
+
+# Filter high-quality genomes
+high_quality <- bacillus_data %>%
+  filter(
+    Completeness >= 90,
+    Contamination <= 5
+  )
+
+# Save HQ genomes
+write.csv(
+  high_quality,
+  "C:/Users/Tofick/Desktop/s22/high_quality_bacillus.csv",
+  row.names = FALSE
+)
+
+# Summary
+cat("Total genomes:", nrow(bacillus_data), "\n")
+cat("High-quality genomes:", nrow(high_quality), "\n")
+
+##################### BUSCO################################
+source ~/micromamba/etc/profile.d/mamba.sh
+micromamba activate busco_env
+mkdir -p /home/tofick/Bacillus_Project/busco_results
+
+for genome in /home/tofick/Bacillus_Project/checkm_input/*.fna
+do
+    name=$(basename "$genome" .fna)
+
+    busco \
+      -i "$genome" \
+      -o busco_"$name" \
+      -l bacillales_odb10 \
+      -m genome \
+      -c 16 \
+      --out_path /home/tofick/Bacillus_Project/busco_results
+done
+
+#nano busco_parser.py
+#!/usr/bin/env python3
+
+import re
+import csv
+from pathlib import Path
+
+# =========================
+# USER INPUT
+# =========================
+BASE_DIR = Path("/home/tofick/Bacillus_Project/busco_results")
+OUTPUT_FILE = Path("busco_results_summary.csv")
+
+
+# =========================
+# PARSE BUSCO FILE
+# =========================
+def parse_busco_file(file_path):
+
+    try:
+        content = file_path.read_text()
+    except Exception as e:
+        print(f"ERROR reading {file_path}: {e}")
+        return None
+
+    # Correct BUSCO v6 pattern
+    pattern = r"C:([\d\.]+)%\[S:([\d\.]+)%,D:([\d\.]+)%\],F:([\d\.]+)%,M:([\d\.]+)%,n:(\d+)"
+
+    match = re.search(pattern, content)
+
+    if not match:
+        print(f"WARNING: BUSCO pattern not found in {file_path}")
+        return None
+
+    return {
+        "Complete": float(match.group(1)),
+        "Single_copy": float(match.group(2)),
+        "Duplicated": float(match.group(3)),
+        "Fragmented": float(match.group(4)),
+        "Missing": float(match.group(5)),
+        "Total": int(match.group(6))
+    }
+
+
+# =========================
+# MAIN PIPELINE
+# =========================
+def main():
+
+    print("\n==============================")
+    print("BUSCO PARSER STARTING")
+    print("==============================\n")
+
+    if not BASE_DIR.exists():
+        print(f"ERROR: BASE_DIR not found: {BASE_DIR}")
+        return
+
+    rows = []
+
+    folders = [f for f in BASE_DIR.iterdir() if f.is_dir()]
+
+    print(f"Found {len(folders)} BUSCO folders\n")
+
+    for i, folder in enumerate(folders, 1):
+
+        busco_files = list(folder.glob("short_summary*.txt"))
+
+        if not busco_files:
+            print(f"[{i}] No BUSCO file in {folder.name}")
+            continue
+
+        file_path = busco_files[0]
+
+        data = parse_busco_file(file_path)
+
+        if not data:
+            print(f"[{i}] Failed parsing {folder.name}")
+            continue
+
+        genome = folder.name
+
+        rows.append({
+            "Genome": genome,
+            **data
+        })
+
+        print(f"[{i}] OK → {genome}")
+
+    # =========================
+    # WRITE CSV
+    # =========================
+    with open(OUTPUT_FILE, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=rows[0].keys())
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print("\n==============================")
+    print("DONE ✔")
+    print(f"Output saved to: {OUTPUT_FILE}")
+    print(f"Genomes processed: {len(rows)}")
+    print("==============================\n")
+
+
+if __name__ == "__main__":
+    main()
+CTRL + X
+Y
+ENTER
+python3 busco_parser.py
