@@ -1,0 +1,213 @@
+###############FASTANI##########################
+conda activate fastani_env
+cd /home/tofick/Bacillus_Project/Bacillus_velezensis_PGPR/fasta
+
+#!/usr/bin/env python3
+
+import os
+import pandas as pd
+import numpy as np
+import networkx as nx
+import matplotlib.pyplot as plt
+import seaborn as sns
+import random
+import logging
+from collections import defaultdict
+from scipy.cluster import hierarchy
+from scipy.spatial.distance import squareform
+
+# ======================
+# CONFIG
+# ======================
+SEED = 1998
+random.seed(SEED)
+np.random.seed(SEED)
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+log = logging.getLogger()
+
+FASTANI_FILE = "/home/tofick/Bacillus_Project/checkm_input/fastani_results/fastani_results.txt"
+GTDB_FILE = "/home/tofick/Bacillus_Project/genomas_GTDB_B.csv"
+OUTDIR = "/home/tofick/Bacillus_Project/checkm_input/fastani_results/ANI_NETWORK"
+os.makedirs(OUTDIR, exist_ok=True)
+
+THRESHOLD = 95.0
+
+
+# ======================
+# LOAD GTDB NAMES
+# ======================
+def load_names(path):
+    df = pd.read_csv(path)
+
+    # EXPECTED COLUMNS (adjust if needed)
+    # Genome, Species
+    name_map = dict(zip(df["Genome"], df["Species"]))
+
+    return name_map
+
+
+# ======================
+# LOAD FASTANI
+# ======================
+def load_fastani(path):
+    log.info("Loading FastANI...")
+
+    df = pd.read_csv(
+        path,
+        sep="\t",
+        header=None,
+        names=["q", "r", "ani", "frag_m", "frag_t"]
+    )
+
+    # clean genome IDs
+    df["q"] = df["q"].apply(lambda x: os.path.basename(str(x)).split("_genomic")[0])
+    df["r"] = df["r"].apply(lambda x: os.path.basename(str(x)).split("_genomic")[0])
+
+    genomes = sorted(set(df["q"]) | set(df["r"]))
+
+    mat = pd.DataFrame(np.nan, index=genomes, columns=genomes).copy()
+    np.fill_diagonal(mat.values, 100.0)
+
+    for _, row in df.iterrows():
+        mat.loc[row["q"], row["r"]] = row["ani"]
+        mat.loc[row["r"], row["q"]] = row["ani"]
+
+    mat = mat.fillna(0)
+
+    log.info(f"Matrix size: {mat.shape}")
+    return mat
+
+
+# ======================
+# BUILD NETWORK
+# ======================
+def build_network(mat):
+    log.info("Building network...")
+
+    G = nx.Graph()
+
+    for g in mat.index:
+        G.add_node(g)
+
+    for i in range(len(mat)):
+        for j in range(i+1, len(mat)):
+            val = mat.iloc[i, j]
+            if val >= THRESHOLD:
+                G.add_edge(mat.index[i], mat.index[j], weight=val)
+
+    log.info(f"Nodes={G.number_of_nodes()} Edges={G.number_of_edges()}")
+    return G
+
+
+# ======================
+# LABEL PROPAGATION
+# ======================
+def lpa(G):
+    log.info("Running LPA...")
+
+    for n in G.nodes:
+        G.nodes[n]["label"] = n
+
+    for _ in range(10):
+        changes = 0
+        nodes = list(G.nodes)
+        random.shuffle(nodes)
+
+        for n in nodes:
+            scores = defaultdict(float)
+
+            for nbr in G.neighbors(n):
+                lbl = G.nodes[nbr]["label"]
+                scores[lbl] += G[n][nbr]["weight"]
+
+            if scores:
+                best = max(scores, key=scores.get)
+                if G.nodes[n]["label"] != best:
+                    G.nodes[n]["label"] = best
+                    changes += 1
+
+        log.info(f"changes={changes}")
+        if changes == 0:
+            break
+
+    return G
+
+
+# ======================
+# APPLY REAL NAMES
+# ======================
+def map_names(G, name_map):
+    labeled = {}
+    for n in G.nodes:
+        labeled[n] = name_map.get(n, n)  # fallback = self
+    return labeled
+
+
+# ======================
+# NETWORK PLOT (ONLY >=95)
+# ======================
+def plot(G, labels):
+    plt.figure(figsize=(12, 10))
+
+    pos = nx.spring_layout(G, seed=SEED)
+
+    groups = defaultdict(list)
+    for n, l in labels.items():
+        groups[l].append(n)
+
+    colors = sns.color_palette("husl", len(groups))
+
+    for i, (lab, nodes) in enumerate(groups.items()):
+        nx.draw_networkx_nodes(G, pos, nodelist=nodes,
+                               node_size=80, node_color=[colors[i]])
+
+    nx.draw_networkx_edges(G, pos, alpha=0.2)
+
+    # highlight S22
+    if "S22" in G.nodes:
+        nx.draw_networkx_nodes(G, pos, nodelist=["S22"],
+                               node_color="red", node_size=200)
+
+    plt.title("Bacillus ANI genomic communities (≥95%)")
+    plt.axis("off")
+
+    plt.savefig(os.path.join(OUTDIR, "network.png"), dpi=300)
+    plt.close()
+
+
+# ======================
+# HEATMAP
+# ======================
+def heatmap(mat):
+    dist = 100 - mat
+    Z = hierarchy.linkage(squareform(dist), method="average")
+
+    sns.clustermap(mat, row_linkage=Z, col_linkage=Z,
+                   cmap="viridis", vmin=90, vmax=100,
+                   figsize=(12, 10))
+
+    plt.savefig(os.path.join(OUTDIR, "heatmap.png"), dpi=300)
+    plt.close()
+
+
+# ======================
+# MAIN
+# ======================
+def main():
+
+    name_map = load_names(GTDB_FILE)
+    mat = load_fastani(FASTANI_FILE)
+
+    G = build_network(mat)
+    G = lpa(G)
+
+    labels = map_names(G, name_map)
+
+    plot(G, labels)
+    heatmap(mat)
+
+    print("DONE ✔")
+
+if __name__ == "__main__":
+    main()
