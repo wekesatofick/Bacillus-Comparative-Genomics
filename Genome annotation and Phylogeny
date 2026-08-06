@@ -1,0 +1,123 @@
+## Use of pyANI
+###Run nummer
+ conda activate pyani_env
+ 
+ # Using blast
+average_nucleotide_identity.py -i . -o ../pyani_output -m ANIb --workers 40
+
+# Using nummer
+average_nucleotide_identity.py -i . -o ../pyani_anim_output -m ANIm --workers 40
+
+# Default graphics
+average_nucleotide_identity.py -i . -o ../pyani_anim_output -m ANIm --workers 40 --graphics
+
+########PROKKA##################
+conda activate prokka_env
+/home/tofick/Bacillus_Project/checkm_input
+nano run_prokka.sh
+#!/bin/bash
+
+set -euo pipefail
+
+# ======================
+# PARAMETERS
+# ======================
+GENOME_DIR="/home/tofick/Bacillus_Project/checkm_input"
+OUTDIR="/home/tofick/Bacillus_Project/prokka_out"
+
+GENUS="Bacillus"
+KINGDOM="Bacteria"
+
+# Adjust depending on your CPU/RAM
+CPUS=20
+
+# ======================
+# CREATE OUTPUT DIRECTORY
+# ======================
+mkdir -p "$OUTDIR"
+
+# Avoid errors if no .fna files exist
+shopt -s nullglob
+
+# ======================
+# RUN PROKKA
+# ======================
+for genome in "$GENOME_DIR"/*.fna; do
+
+    base=$(basename "$genome" .fna)
+
+    echo "======================================="
+    echo "Annotating: $base"
+    echo "======================================="
+
+    prokka "$genome" \
+        --outdir "$OUTDIR/$base" \
+        --prefix "$base" \
+        --genus "$GENUS" \
+        --kingdom "$KINGDOM" \
+        --cpus "$CPUS"
+
+done
+
+echo "======================================="
+echo "Annotation complete!"
+echo "Results saved in: $OUTDIR"
+echo "======================================="
+
+chmod +x run_prokka.sh
+./run_prokka.sh
+
+##################################################
+######## Use of Orthofinderv #####################
+#Install
+conda create -n orthofinder_env orthofinder -c bioconda -c conda-forge
+conda activate orthofinder_env
+
+# Representative genomes for phylogeny
+orthofinder -f genomas_represent/ -S diamond -M msa -t 70  
+
+################################################
+########### Use of MAFFT ######################
+# Install
+conda create -n mafft_env mafft -c bioconda -c conda-forge
+conda activate mafft_env
+
+# Use of single copies:
+Single_Copy_Orthologue_Sequences/
+
+# Create an alignment bash in MAFFT
+#!/bin/bash
+
+# Create directory for alignments
+
+mkdir mafft_alignments
+
+# Align each orthogroup with 30 threads
+for file in Species_Named_Orthogroups/*.fa; do
+    base_name=$(basename “$file” .fa)
+    mafft --auto --thread 30 --quiet “$file” > “mafft_alignments/${base_name}.aln”
+done
+
+##############################################
+######### BGME ##############################
+# Install
+conda install -c bioconda bmge
+
+# Concatenate with the created Python script and then filter.
+# Use BMGE to filter the files. 
+# If it doesn't appear, first find where it is, to indicate.
+find $CONDA_PREFIX -name “BMGE.jar”
+# Indicate where it is; then use the script below.
+ln -s /xxxxx/xxxx/miniconda3/envs/seaborn_env/share/bmge-1.12-1/BMGE.jar
+ln -s /xxxxx/xxxx/miniconda3/envs/seaborn_env/share/bmge-1.12-1/BMGE.jar
+
+# After doing the above, use the concatenation
+java -jar BMGE.jar -i super_matrix_concatenado.fas -t AA -of supermatriz_filtrada.fas
+
+iqtree2 -s supermatrix_filtered.fas \
+       -m MFP \
+       -bb 1000 \
+       -bnni \
+       -nt 6 \
+       -seed 1998 \
+       -pre bacillus_phylogeny
